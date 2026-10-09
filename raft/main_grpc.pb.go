@@ -2,7 +2,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.6.2
 // - protoc             v7.35.1
-// source: main.proto
+// source: raft/main.proto
 
 package raft
 
@@ -155,5 +155,5 @@ var RaftService_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "main.proto",
+	Metadata: "raft/main.proto",
 }

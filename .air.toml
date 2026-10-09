@@ -1,0 +1,33 @@
+# Air configuration for live reload during development
+# Docs: https://github.com/air-verse/air
+
+root = "."
+tmp_dir = "tmp"
+
+[build]
+  # Command used to build the binary
+  cmd = "go build -o ./tmp/raft ./main.go"
+  # Entrypoint binary relative to root (replaces deprecated `bin`)
+  entrypoint = ["./tmp/raft"]
+
+  # Watch these extensions for changes
+  include_ext = ["go", "proto", "toml"]
+  # Directories to ignore
+  exclude_dir = ["tmp", ".git"]
+  # Don't rebuild if only these files change
+  exclude_unchanged = true
+  # Wait before rebuilding (debounce rapid saves)
+  delay = 1000
+  # Stop on build error instead of watching forever
+  stop_on_error = true
+  # Send interrupt to the running process on rebuild, then kill after delay
+  send_interrupt = true
+  kill_delay = "500ms"
+
+[log]
+  # Show timestamps in air logs
+  time = true
+
+[misc]
+  # Delete tmp dir on exit
+  clean_on_exit = true
