@@ -173,19 +173,20 @@ fmt.Println("RequestVote response:", response)
 resChan<-response
 	}()
 	}
+for range r.nodes {	
 	select {
 	case err := <-errChan:
 		fmt.Println("Error received:", err)
-		return
 	case res := <-resChan:
 		if res.VoteGranted {
 			r.currentVotes++
-			if r.currentVotes > len(r.nodes)/2 {
+				}
+}
+}
+if r.currentVotes > len(r.nodes)/2 {
 				r.promotSelfToLeader()
 				fmt.Println("Node", r.id, "became the leader for term", r.term)
-			}
 	}
-}
 
 }
 func (r *RaftNode) promotSelfToLeader(){
