@@ -11,6 +11,10 @@ gen-proto:
         --go-grpc_out=paths=source_relative:. \
         $(find . -name '*.proto' -not -path './tmp/*')
 
+# Spin up a 3-node in-process cluster and observe an election (verbose logs)
+sandbox:
+    go test -run 'TestSandboxElection' -v -count=1 -timeout 90s .
+
 # List available recipes
 default:
     @just --list

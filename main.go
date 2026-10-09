@@ -3,8 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -45,7 +48,7 @@ const HEARTBEAT_INTERVAL = 50 * time.Millisecond
 type RaftNode struct{
 	//For now just an int
 	id int
-resetElectionCh chan struct{} 
+  resetElectionCh chan struct{} 
 	term int //Current term of the node
 	votedFor int//To keep track who the node voted for in the current term, -1 if it hasn't voted yet
 	currentVotes int //To keep track of the votes received in the current term , //Resets to 0 when the term changes
@@ -67,12 +70,17 @@ resetElectionCh chan struct{}
 }
 func NewRaftNode(id int, host string, port int, peers []RaftPeer) *RaftNode {
 	nodes := make(map[string]RaftPeer, len(peers))
+	resetTimerCh:=make(chan struct{})
 
 	for _, peer := range peers {
 		nodes[fmt.Sprint(peer.id)] = peer
 	}
+	timeout:=rand.IntN(150)
+	timeout+=150
+
 
 	return &RaftNode{
+		resetElectionCh: resetTimerCh,
 		id:               id,
 		term:             0,
 		votedFor:         -1,
@@ -84,7 +92,7 @@ func NewRaftNode(id int, host string, port int, peers []RaftPeer) *RaftNode {
 		nextIndex:        0,
 		leaderId:         -1,
 		state:            FOLLOWER,
-		electionTimeout:  250 * time.Millisecond,
+		electionTimeout:  time.Duration(timeout) * time.Millisecond,
 		nodes:            nodes,
 		log:              make([]LogEntry, 0),
 		nextIndexMap:     make(map[int]int),
@@ -95,17 +103,16 @@ func NewRaftNode(id int, host string, port int, peers []RaftPeer) *RaftNode {
 //TODO:review this logic because it is a bit iffy
 //Rpc Handlers  of a raftNode
 func (r *RaftNode) RequestVote(ctx context.Context, in *raft.RequestVoteRequest) (*raft.RequestVoteResponse, error){
-
 	if r.votedFor != -1 && r.votedFor != int(in.CandidateId){
 		return &raft.RequestVoteResponse{Term: int32(r.term),VoteGranted: false},nil 	
 	}
 	//Verify what node is more "up-to-date"
+	r.votedFor = -1 //Reset votedFor to allow for new votes
 	if in.Term< int32(r.term) {
 		return &raft.RequestVoteResponse{Term: int32(r.term),VoteGranted: false},nil
-	}
+	} 
 	if r.nextIndex < int(in.LastLogIndex) { 
 	return  &raft.RequestVoteResponse{Term: int32(r.term),VoteGranted: false},nil
-
 }
 
 if r.nextIndex>0 && r.log[r.nextIndex].term > int(in.LastLogIndex){
@@ -182,10 +189,15 @@ resChan<-response
 
 }
 func (r *RaftNode) promotSelfToLeader(){
-			r.state = LEADER
+	slog.Info(
+    "Node is promoting itself to leader",
+    "node_id", strconv.Itoa(r.id),
+    "term", strconv.Itoa( r.term ),
+)
+r.state = LEADER
 			r.leaderId = r.id
+			r.votedFor = -1
 			r.currentVotes = 0
-			//Starts the heartbeat ticker to send heartbeats to all peers
      go r.startHearbeat()
 }
 func (r *RaftNode) startElectionTimer(){
@@ -234,7 +246,10 @@ func sendHeartBeatToAllPeers(r *RaftNode){
 func (r *RaftNode) startHearbeat(){
 	ticker:= time.NewTicker(HEARTBEAT_INTERVAL)
 	defer ticker.Stop()
-	for _ = range ticker.C {
+	for  range ticker.C {
+		if r.state != LEADER {
+			return
+		}
 			sendHeartBeatToAllPeers(r)
 		}
 }
@@ -248,13 +263,13 @@ func (r *RaftNode) AppendEntries(ctx context.Context, in *raft.AppendEntriesRequ
 	}
 	if in.Entries == nil || len(in.Entries) == 0 {
 		fmt.Println("Received heartbeat from leader", in.LeaderId, "for term", in.Term)
-			r.leaderId = int(in.LeaderId)
+		r.state=FOLLOWER
+		r.leaderId = int(in.LeaderId)
+		r.currentVotes = 0  
 		r.term = int(in.Term)
 		
 		//To keep it non-blocking we will use a select statement to reset the election timer
-select { case r.resetElectionCh <- struct{}{}: default: }
-	
-	
+    select { case r.resetElectionCh <- struct{}{}: default: }
 		return &raft.AppendEntriesResponse{Term: int32(r.term), Success: true}, nil
 	}
 	return &raft.AppendEntriesResponse{Term: int32(r.term), Success: false}, nil
@@ -287,7 +302,6 @@ resChan<-response
 func (r *RaftNode) Run() error{
 	  go r.startElectionTimer() 
 		lis, err := net.Listen("tcp", fmt.Sprintf("%s:%d",r.peerInfo.host,r.peerInfo.port))
-		defer lis.Close()
 		if err!=nil{
 			return err
 		}
