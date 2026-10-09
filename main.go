@@ -48,7 +48,9 @@ const HEARTBEAT_INTERVAL = 50 * time.Millisecond
 type RaftNode struct{
 	//For now just an int
 	id int
+	server *grpc.Server
   resetElectionCh chan struct{} 
+	stopHeartbeatCh chan struct{}
 	term int //Current term of the node
 	votedFor int//To keep track who the node voted for in the current term, -1 if it hasn't voted yet
 	currentVotes int //To keep track of the votes received in the current term , //Resets to 0 when the term changes
@@ -70,7 +72,8 @@ type RaftNode struct{
 }
 func NewRaftNode(id int, host string, port int, peers []RaftPeer) *RaftNode {
 	nodes := make(map[string]RaftPeer, len(peers))
-	resetTimerCh:=make(chan struct{})
+	resetTimerCh:=make(chan struct{},1)
+	stopHeartBeatCh:=make(chan struct{},1)
 
 	for _, peer := range peers {
 		nodes[fmt.Sprint(peer.id)] = peer
@@ -81,6 +84,7 @@ func NewRaftNode(id int, host string, port int, peers []RaftPeer) *RaftNode {
 
 	return &RaftNode{
 		resetElectionCh: resetTimerCh,
+		stopHeartbeatCh: stopHeartBeatCh,
 		id:               id,
 		term:             0,
 		votedFor:         -1,
@@ -103,15 +107,20 @@ func NewRaftNode(id int, host string, port int, peers []RaftPeer) *RaftNode {
 //TODO:review this logic because it is a bit iffy
 //Rpc Handlers  of a raftNode
 func (r *RaftNode) RequestVote(ctx context.Context, in *raft.RequestVoteRequest) (*raft.RequestVoteResponse, error){
+if in.Term< int32(r.term) {
+		return &raft.RequestVoteResponse{Term: int32(r.term),VoteGranted: false},nil
+	} else{
+   r.term = int(in.Term) 
+    r.votedFor = -1
+    r.state = FOLLOWER
+    r.leaderId = -1
+	}
+
 	if r.votedFor != -1 && r.votedFor != int(in.CandidateId){
 		return &raft.RequestVoteResponse{Term: int32(r.term),VoteGranted: false},nil 	
 	}
 	//Verify what node is more "up-to-date"
-	r.votedFor = -1 //Reset votedFor to allow for new votes
-	if in.Term< int32(r.term) {
-		return &raft.RequestVoteResponse{Term: int32(r.term),VoteGranted: false},nil
-	} 
-	if r.nextIndex < int(in.LastLogIndex) { 
+		if r.nextIndex < int(in.LastLogIndex) { 
 	return  &raft.RequestVoteResponse{Term: int32(r.term),VoteGranted: false},nil
 }
 
@@ -247,13 +256,22 @@ func sendHeartBeatToAllPeers(r *RaftNode){
 func (r *RaftNode) startHearbeat(){
 	ticker:= time.NewTicker(HEARTBEAT_INTERVAL)
 	defer ticker.Stop()
-	for  range ticker.C {
-		if r.state != LEADER {
+	for {
+   select {
+		 	 case <-r.stopHeartbeatCh:
+				 return
+			case <-ticker.C: 
+			  if r.state != LEADER {
 			return
-		}
+	   	}
 			sendHeartBeatToAllPeers(r)
-		}
-}
+
+	 }
+	}
+	}
+	func StopHeartBeat(r *RaftNode){
+		r.stopHeartbeatCh <- struct{}{}
+	}
 func (r *RaftNode) AppendEntries(ctx context.Context, in *raft.AppendEntriesRequest) (*raft.AppendEntriesResponse, error){
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -301,6 +319,7 @@ if err != nil {
 resChan<-response
 }
 func (r *RaftNode) Run() error{
+
 	  go r.startElectionTimer() 
 		lis, err := net.Listen("tcp", fmt.Sprintf("%s:%d",r.peerInfo.host,r.peerInfo.port))
 		if err!=nil{
@@ -308,6 +327,7 @@ func (r *RaftNode) Run() error{
 		}
 	server:=grpc.NewServer()
 	raft.RegisterRaftServiceServer(server,r)
+	r.server=server
 
 	if err:=server.Serve(lis);err!=nil{
 		return err;
