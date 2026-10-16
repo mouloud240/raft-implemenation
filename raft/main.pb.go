@@ -144,7 +144,8 @@ func (x *RequestVoteResponse) GetVoteGranted() bool {
 type LogEntry struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Term          int32                  `protobuf:"varint,1,opt,name=term" json:"term,omitempty"`
-	Command       string                 `protobuf:"bytes,2,opt,name=command" json:"command,omitempty"`
+	Index         int32                  `protobuf:"varint,2,opt,name=index" json:"index,omitempty"`
+	Command       string                 `protobuf:"bytes,3,opt,name=command" json:"command,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -182,6 +183,13 @@ func (*LogEntry) Descriptor() ([]byte, []int) {
 func (x *LogEntry) GetTerm() int32 {
 	if x != nil {
 		return x.Term
+	}
+	return 0
+}
+
+func (x *LogEntry) GetIndex() int32 {
+	if x != nil {
+		return x.Index
 	}
 	return 0
 }
@@ -341,10 +349,11 @@ const file_raft_main_proto_rawDesc = "" +
 	"\vlastLogTerm\x18\x04 \x01(\x05R\vlastLogTerm\"K\n" +
 	"\x13RequestVoteResponse\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x05R\x04term\x12 \n" +
-	"\vvoteGranted\x18\x02 \x01(\bR\vvoteGranted\"8\n" +
+	"\vvoteGranted\x18\x02 \x01(\bR\vvoteGranted\"N\n" +
 	"\bLogEntry\x12\x12\n" +
-	"\x04term\x18\x01 \x01(\x05R\x04term\x12\x18\n" +
-	"\acommand\x18\x02 \x01(\tR\acommand\"\xd5\x01\n" +
+	"\x04term\x18\x01 \x01(\x05R\x04term\x12\x14\n" +
+	"\x05index\x18\x02 \x01(\x05R\x05index\x12\x18\n" +
+	"\acommand\x18\x03 \x01(\tR\acommand\"\xd5\x01\n" +
 	"\x14AppendEntriesRequest\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x05R\x04term\x12\x1a\n" +
 	"\bleaderId\x18\x02 \x01(\x05R\bleaderId\x12\"\n" +

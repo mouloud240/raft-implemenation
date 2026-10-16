@@ -25,7 +25,8 @@ message RequestVoteResponse {
 }
 message LogEntry {
   int32 term = 1;
-  string command = 2;
+  int32 index = 2;
+  string command = 3;
 }
 message AppendEntriesRequest {
   int32 term = 1;

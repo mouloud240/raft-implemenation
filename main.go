@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -48,6 +50,7 @@ const HEARTBEAT_INTERVAL = 50 * time.Millisecond
 type RaftNode struct{
 	//For now just an int
 	id int
+  apiClient http.ServeMux
 	server *grpc.Server
   resetElectionCh chan struct{} 
 	stopHeartbeatCh chan struct{}
@@ -70,6 +73,55 @@ type RaftNode struct{
 	mu sync.Mutex
 	raft.UnimplementedRaftServiceServer
 }
+
+func (r *RaftNode) CommitCommand(cmd Command) error{ 
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if (cmd.operation==SET){
+	r.stateMachine[cmd.key] = cmd.value
+	} else if  (cmd.operation==INCREMENT){
+		_,ok:=r.stateMachine[cmd.key]
+		if (!ok){
+			return errors.New("key does not exist")
+		}
+		r.stateMachine[cmd.key] += cmd.value
+
+	}else if (cmd.operation==DELETE){
+		delete(r.stateMachine, cmd.key)
+	}else {
+		return errors.New("invalid operation")
+	}
+	r.commitIndex++
+	return nil
+}
+type SetKeyClientRequest struct {
+	Key string `json:"key" binding:"required ,min=1"`
+	Value int `json:"value" binding:"required ,min=1"`
+}
+func NewRaftApiClient() *http.ServeMux{
+	
+
+	mux:=http.NewServeMux();
+	mux.HandleFunc("POST /set", func(w http.ResponseWriter, r *http.Request) {
+	rawBody := make([]byte, r.ContentLength)
+	r.Body.Read(rawBody)
+	defer r.Body.Close()
+	var body SetKeyClientRequest
+	if err := json.Unmarshal(rawBody, &body); err != nil {
+		    http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+	}
+})
+mux.HandleFunc("GET /get/{key}" ,func(w http.ResponseWriter, r *http.Request) {
+	rawKey:=r.PathValue("key")
+	key,err:=strconv.ParseInt(rawKey,10,64)
+	if err!=nil{
+		http.Error(w,err.Error(),http.StatusBadRequest)
+	}
+	fmt.Print(key)
+})
+return mux
+}
 func NewRaftNode(id int, host string, port int, peers []RaftPeer) *RaftNode {
 	nodes := make(map[string]RaftPeer, len(peers))
 	resetTimerCh:=make(chan struct{},1)
@@ -81,6 +133,7 @@ func NewRaftNode(id int, host string, port int, peers []RaftPeer) *RaftNode {
 	timeout:=rand.IntN(150)
 	timeout+=150
 
+	
 
 	return &RaftNode{
 		resetElectionCh: resetTimerCh,
@@ -190,8 +243,18 @@ for range r.nodes {
 		if res.VoteGranted {
 			r.currentVotes++
 				}
+				if (r.currentVotes > len(r.nodes)/2) {
+					//Exit Early
+					r.promotSelfToLeader()
+					fmt.Println("Node", r.id, "became the leader for term", r.term)
+					//Other go routines will still be running but we will ignore their responses
+					return;
+
+					
+				}
 }
 }
+//Keep this in case we exit the loop on the last item ig (I think I can remove this but I will come back to it )
 if r.currentVotes > len(r.nodes)/2 {
 				r.promotSelfToLeader()
 				fmt.Println("Node", r.id, "became the leader for term", r.term)
@@ -273,25 +336,45 @@ func (r *RaftNode) startHearbeat(){
 		r.stopHeartbeatCh <- struct{}{}
 	}
 func (r *RaftNode) AppendEntries(ctx context.Context, in *raft.AppendEntriesRequest) (*raft.AppendEntriesResponse, error){
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.term > int(in.Term) {
+	// We exit early first then start mutating the object
+	if int(in.Term) < r.term {
 		// For now we won't reset other metrics 
 		return &raft.AppendEntriesResponse{Term: int32(r.term), Success: false}, nil
-	
 	}
-	if in.Entries == nil || len(in.Entries) == 0 {
-		fmt.Println("Received heartbeat from leader", in.LeaderId, "for term", in.Term)
-		r.state=FOLLOWER
+	if r.log[int(in.PrevLogIndex)].term != int(in.PrevLogTerm) {
+		return &raft.AppendEntriesResponse{Term: int32(r.term), Success: false},nil
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if (in.LeaderCommit> int32(r.commitIndex)){
+		r.commitIndex=min(int(in.LeaderCommit),int(in.Entries[len(in.Entries)-1].Index))
+	}
+
+	//Extracted here since this is a common logic either for hearbeat or for log replication
+	 r.state=FOLLOWER
 		r.leaderId = int(in.LeaderId)
 		r.currentVotes = 0  
 		r.term = int(in.Term)
-		
+
+	if in.Entries == nil || len(in.Entries) == 0 {
+		fmt.Println("Received heartbeat from leader", in.LeaderId, "for term", in.Term)
 		//To keep it non-blocking we will use a select statement to reset the election timer
     select { case r.resetElectionCh <- struct{}{}: default: }
 		return &raft.AppendEntriesResponse{Term: int32(r.term), Success: true}, nil
 	}
-	return &raft.AppendEntriesResponse{Term: int32(r.term), Success: false}, nil
+
+	for _,entry :=range in.Entries {
+		isConflicting:= entry.GetTerm() != int32(r.log[entry.Index].term)
+		if (isConflicting){
+			//Delete all entries from the conflicting index onwards
+			// We will pass into the next line which should be able to append anyways
+			r.log=r.log[:entry.Index]
+		}
+		r.log=append(r.log, LogEntry{cmd: CommandFromString(entry.Command), index: int(entry.Index), term: int(entry.Term)})
+	}
+		return &raft.AppendEntriesResponse{Term: int32(r.term), Success: false}, nil
 }
 func (r *RaftNode) AppendEntriesRpcCall(entries []*raft.LogEntry, peer RaftPeer, errChan chan error, resChan chan *raft.AppendEntriesResponse){
   conn,err:=grpc.NewClient(fmt.Sprintf("%s:%d",peer.host,peer.port),grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -362,6 +445,10 @@ type LogEntry struct {
 	index int //Position in the log
 	term int
 }
+func (l LogEntry) GetIndex() int {
+	return l.index
+
+}
 func (l LogEntry) ToRpcFormat() *raft.LogEntry{
 	return &raft.LogEntry{
 		Command:   l.cmd.String(),
@@ -385,6 +472,7 @@ type RaftRpc interface{
 	RequestVoteRpc(body RequestVoteRpcBody) (term int, voteGranted bool)
 	AppendEntriesRpc(body AppendEntriesRpcBody) (term int, success bool)
 }
+
 
 
 func main() {
