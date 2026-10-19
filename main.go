@@ -46,6 +46,28 @@ type RaftPeer struct {
 	host string
 	port int
 }
+type Command struct {
+	key       string 
+	value     int
+	operation Operation
+}
+
+
+func CommandFromString(cmd string) Command {
+
+	return Command{}
+}
+func (c Command) String() string {
+	return ""
+}
+
+
+//Http body
+type ExecuteCommandClientRequest struct {
+	Key   string `json:"key" binding:"required ,min=1"`
+	Value int    `json:"value" binding:"required ,min=1"`
+	Operation Operation  `json:"operation" binding:"required"`
+}
 
 const HEARTBEAT_INTERVAL = 50 * time.Millisecond
 
@@ -71,13 +93,70 @@ type RaftNode struct {
 	leaderId        int //Id of the current leader // if the node is a leader, this will be its own id
 	state           NodeState
 	electionTimeout time.Duration       // Randomized between 150-300ms
-	nodes           map[string]RaftPeer // A map of all nodes in the cluster , excluding itself, key is the nodeId
+	nodes           map[int]RaftPeer // A map of all nodes in the cluster , excluding itself, key is the nodeId
 	log             []LogEntry          //Log entries
 	nextIndexMap    map[int]int         //Map of nodeId to nextIndex for each node
 	matchIndexMap   map[int]int         //Map of nodeId to matchIndex for each node
 	stateMachine    map[string]int      //Key-value store
 	mu              sync.Mutex
 	raft.UnimplementedRaftServiceServer
+}
+func (r *RaftNode) GetNodeById(id int) (RaftPeer, bool) {
+	peer, ok := r.nodes[id]
+	return peer, ok
+}
+func (req *ExecuteCommandClientRequest) ToCommand() Command {
+	return Command{
+		key:       req.Key,
+		value:     req.Value,
+		operation: req.Operation,
+	}
+}
+
+type nodeError struct {
+	error 
+	NodeId int //For retries
+
+}
+
+//Function to handle appendEntries Clients requests
+func (r *RaftNode)HandleAppendEntry(body ExecuteCommandClientRequest){
+	if (r.state != LEADER) {
+		//Forward to the leader 
+		//NOTE: I think how will the forwarding work , Grpc? Modifiny the rest hosts ? sending an err to the client ?
+		//NOte: Candidates Are either grpc or putting everything behind  a reversy proxy that knows the leader
+	}
+	successCount:=0
+	resChan := make(chan *raft.AppendEntriesResponse)
+	errChan := make(chan nodeError)
+	for _, peer := range r.nodes {
+		go func(peer RaftPeer) {
+			r.AppendEntriesRpcCall([]*raft.LogEntry{&raft.LogEntry{
+				Command:body.ToCommand().String(),
+				Term: int32(r.term),
+				Index: int32(r.nextIndex),
+			}}, peer, errChan, resChan)
+		}(peer)
+	}
+	for {
+		select {
+		case err := <-errChan:
+			//TODO : should retry here
+			fmt.Println("Error received:", err)
+		case res := <-resChan:
+			if res.Success {
+				successCount++
+			}
+			if successCount > len(r.nodes)/2 {
+				//Commit the command to the state machine
+				r.CommitCommand(body.ToCommand())
+				fmt.Println("Command committed successfully")
+				//Return to the client 
+				return
+			}
+		}
+	}
+
 }
 
 func (r *RaftNode) CommitCommand(cmd Command) error {
@@ -101,10 +180,6 @@ func (r *RaftNode) CommitCommand(cmd Command) error {
 	return nil
 }
 
-type SetKeyClientRequest struct {
-	Key   string `json:"key" binding:"required ,min=1"`
-	Value int    `json:"value" binding:"required ,min=1"`
-}
 
 func NewRaftApiClient() *http.ServeMux {
 
@@ -113,11 +188,12 @@ func NewRaftApiClient() *http.ServeMux {
 		rawBody := make([]byte, r.ContentLength)
 		r.Body.Read(rawBody)
 		defer r.Body.Close()
-		var body SetKeyClientRequest
+		var body ExecuteCommandClientRequest 
 		if err := json.Unmarshal(rawBody, &body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		
 	})
 	mux.HandleFunc("GET /get/{key}", func(w http.ResponseWriter, r *http.Request) {
 		rawKey := r.PathValue("key")
@@ -130,12 +206,12 @@ func NewRaftApiClient() *http.ServeMux {
 	return mux
 }
 func NewRaftNode(id int, host string, port int, peers []RaftPeer) *RaftNode {
-	nodes := make(map[string]RaftPeer, len(peers))
+	nodes := make(map[int]RaftPeer, len(peers))
 	resetTimerCh := make(chan struct{}, 1)
 	stopHeartBeatCh := make(chan struct{}, 1)
 
 	for _, peer := range peers {
-		nodes[fmt.Sprint(peer.id)] = peer
+		nodes[peer.id] = peer
 	}
 	timeout := rand.IntN(150)
 	timeout += 150
@@ -303,11 +379,12 @@ func (r *RaftNode) startElectionTimer() {
 func sendHeartBeatToAllPeers(r *RaftNode) {
 	for _, peer := range r.nodes {
 		go func(peer RaftPeer) {
-			errChan := make(chan error)
+			errChan := make(chan nodeError)
 			resChan := make(chan *raft.AppendEntriesResponse)
 			r.AppendEntriesRpcCall([]*raft.LogEntry{}, peer, errChan, resChan)
 			select {
 			case err := <-errChan:
+				//TODO: should retry here
 				fmt.Println("Error received:", err)
 				return
 			case res := <-resChan:
@@ -406,10 +483,10 @@ func (r *RaftNode) AppendEntries(ctx context.Context, in *raft.AppendEntriesRequ
 	return &raft.AppendEntriesResponse{Term: int32(r.term), Success: true}, nil
 
 }
-func (r *RaftNode) AppendEntriesRpcCall(entries []*raft.LogEntry, peer RaftPeer, errChan chan error, resChan chan *raft.AppendEntriesResponse) {
+func (r *RaftNode) AppendEntriesRpcCall(entries []*raft.LogEntry, peer RaftPeer, errChan chan nodeError, resChan chan *raft.AppendEntriesResponse) {
 	conn, err := grpc.NewClient(fmt.Sprintf("%s:%d", peer.host, peer.port), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		errChan <- err
+		errChan <- nodeError{error: err,NodeId: r.id}
 		fmt.Println("Error creating grpc client:", err)
 		return
 	}
@@ -427,7 +504,7 @@ func (r *RaftNode) AppendEntriesRpcCall(entries []*raft.LogEntry, peer RaftPeer,
 	response, err := client.AppendEntries(ctx, request)
 	if err != nil {
 		fmt.Println("Error calling AppendEntries:", err)
-		errChan <- err
+		errChan <- nodeError{error: err,NodeId: r.id}
 		return
 	}
 	resChan <- response
@@ -457,19 +534,8 @@ type RequestVoteRpcBody struct {
 	lastLogIndex int
 	lastLogTerm  int
 }
-type Command struct {
-	key       string
-	value     int
-	operation Operation
-}
 
-func CommandFromString(cmd string) Command {
 
-	return Command{}
-}
-func (c Command) String() string {
-	return ""
-}
 
 type LogEntry struct {
 	cmd   Command
