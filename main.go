@@ -25,7 +25,15 @@ import (
 // Client server communication will be RESTfull for the time being for simplicity, and will  not matter much either
 
 // Note for now this type will change since those are only for mapping concepts , they will eventually use the generated types from .proto files
+
+
+//NOTE: To self:  On commited vs applied
+//Commited entry means an entry that has been replicated on the majority of the nodes in the cluster.
+// Applied entry: Is a "Commited" Entry that was applied to the state machine 
+// Entry states: Received (ig) --> Commited --> Applied (this is an asyclic one directional graph, so once an entry is applied it will never be un-applied, but it can be commited and then uncommited if the leader changes and the new leader doesn't have that entry in its log)
 type Operation int
+
+
 
 const (
 	SET Operation = iota
@@ -121,6 +129,8 @@ type nodeError struct {
 
 //Function to handle appendEntries Clients requests
 func (r *RaftNode)HandleAppendEntry(body ExecuteCommandClientRequest){
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if (r.state != LEADER) {
 		//Forward to the leader 
 		//NOTE: I think how will the forwarding work , Grpc? Modifiny the rest hosts ? sending an err to the client ?
@@ -129,6 +139,7 @@ func (r *RaftNode)HandleAppendEntry(body ExecuteCommandClientRequest){
 	successCount:=0
 	resChan := make(chan *raft.AppendEntriesResponse)
 	errChan := make(chan nodeError)
+	r.log = append(r.log, LogEntry{index: r.nextIndex,term: r.term, cmd: body.ToCommand()})
 	for _, peer := range r.nodes {
 		go func(peer RaftPeer) {
 			r.AppendEntriesRpcCall([]*raft.LogEntry{&raft.LogEntry{
@@ -138,6 +149,8 @@ func (r *RaftNode)HandleAppendEntry(body ExecuteCommandClientRequest){
 			}}, peer, errChan, resChan)
 		}(peer)
 	}
+	r.nextIndex++
+
 	for {
 		select {
 		case err := <-errChan:
@@ -149,7 +162,9 @@ func (r *RaftNode)HandleAppendEntry(body ExecuteCommandClientRequest){
 			}
 			if successCount > len(r.nodes)/2 {
 				//Commit the command to the state machine
-				r.CommitCommand(body.ToCommand())
+				r.MarkAsCommited(r.nextIndex-1)
+				r.ApplyCommand(body.ToCommand())
+				r.lastApplied++;
 				fmt.Println("Command committed successfully")
 				//Return to the client 
 				return
@@ -159,10 +174,14 @@ func (r *RaftNode)HandleAppendEntry(body ExecuteCommandClientRequest){
 
 }
 
-func (r *RaftNode) CommitCommand(cmd Command) error {
+func (r *RaftNode) MarkAsCommited(index int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if cmd.operation == SET {
+		r.commitIndex++;
+}
+// Apply a single command to the state machine and doens't update the applyIndex (doesn't check if the command were commited or not, that should be done before calling this function)
+func (r *RaftNode) ApplyCommand(cmd Command) error {
+		if cmd.operation == SET {
 		r.stateMachine[cmd.key] = cmd.value
 	} else if cmd.operation == INCREMENT {
 		_, ok := r.stateMachine[cmd.key]
@@ -176,7 +195,6 @@ func (r *RaftNode) CommitCommand(cmd Command) error {
 	} else {
 		return errors.New("invalid operation")
 	}
-	r.commitIndex++
 	return nil
 }
 
@@ -242,6 +260,9 @@ func NewRaftNode(id int, host string, port int, peers []RaftPeer) *RaftNode {
 // TODO:review this logic because it is a bit iffy
 // Rpc Handlers  of a raftNode
 func (r *RaftNode) RequestVote(ctx context.Context, in *raft.RequestVoteRequest) (*raft.RequestVoteResponse, error) {
+r.mu.Lock()
+	defer r.mu.Unlock()
+
 	if in.Term < int32(r.term) {
 		return &raft.RequestVoteResponse{Term: int32(r.term), VoteGranted: false}, nil
 	} else {
@@ -255,19 +276,23 @@ func (r *RaftNode) RequestVote(ctx context.Context, in *raft.RequestVoteRequest)
 		return &raft.RequestVoteResponse{Term: int32(r.term), VoteGranted: false}, nil
 	}
 	//Verify what node is more "up-to-date"
-	if r.nextIndex < int(in.LastLogIndex) {
+	myIdx := len(r.log) - 1 // -1 means empty log
+	myTerm := -1
+	if myIdx >= 0 {
+		myTerm = r.log[myIdx].term
+	}
+	if int(in.LastLogTerm) < myTerm ||
+		(int(in.LastLogTerm) == myTerm && int(in.LastLogIndex) < myIdx) {
 		return &raft.RequestVoteResponse{Term: int32(r.term), VoteGranted: false}, nil
 	}
-
-	if r.nextIndex > 0 && r.log[r.nextIndex].term > int(in.LastLogIndex) {
-		return &raft.RequestVoteResponse{Term: int32(r.term), VoteGranted: false}, nil
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.votedFor = int(in.CandidateId)
+	
+		r.votedFor = int(in.CandidateId)
 	r.term = int(in.Term)
 	// If the node is more up-to-date, vote for the candidate
 	return &raft.RequestVoteResponse{Term: int32(r.term), VoteGranted: true}, nil
+}
+func (r *RaftNode) LastLogIndex() int {
+	return 5
 }
 
 func (r *RaftNode) RequestVoteRpc() {
@@ -450,10 +475,12 @@ func (r *RaftNode) AppendEntries(ctx context.Context, in *raft.AppendEntriesRequ
 	}
 	if newCommit := min(int(in.LeaderCommit), lastNew); newCommit > r.commitIndex {
 		r.commitIndex = newCommit
+		r.ApplyCommitedEntries()
 	}
 	if in.Entries == nil || len(in.Entries) == 0 {
 		slog.Info("Received heartbeat from leader", in.LeaderId, "for term", in.Term)
 		//To keep it non-blocking we will use a select statement to reset the election timer
+
 		select {
 		case r.resetElectionCh <- struct{}{}:
 		default:
@@ -475,6 +502,11 @@ func (r *RaftNode) AppendEntries(ctx context.Context, in *raft.AppendEntriesRequ
 
 		r.log = append(r.log, LogEntry{cmd: CommandFromString(entry.Command), index: int(entry.Index), term: int(entry.Term)})
 	}
+	
+
+  
+	
+	
 	select {
 	case r.resetElectionCh <- struct{}{}:
 	default:
@@ -482,6 +514,16 @@ func (r *RaftNode) AppendEntries(ctx context.Context, in *raft.AppendEntriesRequ
 
 	return &raft.AppendEntriesResponse{Term: int32(r.term), Success: true}, nil
 
+}
+//Caller should hold r.mu
+func (r *RaftNode) ApplyCommitedEntries() {
+	for r.lastApplied < r.commitIndex {
+		r.lastApplied++
+		entry := r.log[r.lastApplied]
+		if err := r.ApplyCommand(entry.cmd); err != nil {
+			fmt.Println("Error applying committed entry:", err)
+		}
+	}
 }
 func (r *RaftNode) AppendEntriesRpcCall(entries []*raft.LogEntry, peer RaftPeer, errChan chan nodeError, resChan chan *raft.AppendEntriesResponse) {
 	conn, err := grpc.NewClient(fmt.Sprintf("%s:%d", peer.host, peer.port), grpc.WithTransportCredentials(insecure.NewCredentials()))
