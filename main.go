@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -56,13 +57,38 @@ type Command struct {
 	value     int
 	operation Operation
 }
+func OperationFromInt(op int) Operation {
+	switch op {
+	case 0:
+		return SET
+	case 1:
+		return INCREMENT
+	case 2:
+		return DELETE
+	default:
+		panic("Invalid operation")
+	}
+}
 
 func CommandFromString(cmd string) Command {
+	parts:=strings.Split(cmd, "|")
+	if (len(parts)!=3){
+		panic("Invalid command string")
+	}
 
-	return Command{}
+	value, err := strconv.Atoi(parts[1])
+	if err != nil {
+		panic("Invalid command string")
+	}
+	op,err:= strconv.Atoi(parts[2])
+
+  if err!=nil{
+		panic("Invalid command string")
+	}
+	return Command{key: parts[0], value:value,operation: OperationFromInt(op)}
 }
 func (c Command) String() string {
-	return ""
+	return fmt.Sprintf("%s|%d|%d", c.key, c.value, c.operation)
 }
 
 // Http body
@@ -428,7 +454,14 @@ func (r *RaftNode) promotSelfToLeader() {
 	r.leaderId = r.id
 	r.votedFor = -1
 	r.currentVotes = 0
+
 	go r.startHearbeat()
+	go r.UpdateRoutingConfig()
+}
+//For the current approach this will update the caddy reverse proxy config to point to the new leader, and will reload caddy
+func (r *RaftNode) UpdateRoutingConfig(){
+	slog.Info("Updating routing config to point to new leader", "leader_id", strconv.Itoa(r.leaderId))
+
 }
 func (r *RaftNode) startElectionTimer() {
 	if r.state == LEADER {
