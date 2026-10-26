@@ -26,14 +26,11 @@ import (
 
 // Note for now this type will change since those are only for mapping concepts , they will eventually use the generated types from .proto files
 
-
-//NOTE: To self:  On commited vs applied
-//Commited entry means an entry that has been replicated on the majority of the nodes in the cluster.
-// Applied entry: Is a "Commited" Entry that was applied to the state machine 
+// NOTE: To self:  On commited vs applied
+// Commited entry means an entry that has been replicated on the majority of the nodes in the cluster.
+// Applied entry: Is a "Commited" Entry that was applied to the state machine
 // Entry states: Received (ig) --> Commited --> Applied (this is an asyclic one directional graph, so once an entry is applied it will never be un-applied, but it can be commited and then uncommited if the leader changes and the new leader doesn't have that entry in its log)
 type Operation int
-
-
 
 const (
 	SET Operation = iota
@@ -55,11 +52,10 @@ type RaftPeer struct {
 	port int
 }
 type Command struct {
-	key       string 
+	key       string
 	value     int
 	operation Operation
 }
-
 
 func CommandFromString(cmd string) Command {
 
@@ -69,46 +65,88 @@ func (c Command) String() string {
 	return ""
 }
 
-
-//Http body
+// Http body
 type ExecuteCommandClientRequest struct {
-	Key   string `json:"key" binding:"required ,min=1"`
-	Value int    `json:"value" binding:"required ,min=1"`
-	Operation Operation  `json:"operation" binding:"required"`
+	Key       string    `json:"key" binding:"required ,min=1"`
+	Value     int       `json:"value" binding:"required ,min=1"`
+	Operation Operation `json:"operation" binding:"required"`
 }
 
 const HEARTBEAT_INTERVAL = 50 * time.Millisecond
 
 // This will also represent the server that will be running the node
 // I mean we could have a seperate server type that will have RaftNode as a field but for now this will do
-// All int entries will be 0 indexed, so the first entry will be at index 0, -1 will represent null values
-// TODO: group fileds into structs , example persistenState, volatileState, etc
-type RaftNode struct {
-	//For now just an int
+//
+// # All int entries will be 0 indexed, so the first entry will be at index 0, -1 will represent null values
+//
+// The four structs below group RaftNode's state following the paper's Figure 2
+// "State" table. They are embedded anonymously, so field promotion keeps the
+// accessor syntax identical (r.term, r.log, r.commitIndex, ...) and no call
+// site had to change. Whatever the table does not define lives in runtimeState.
+type persistentState struct {
+	// latest term server has seen (initialized to 0 on first boot, increases
+	// monotonically). Figure 2: updated on stable storage before responding
+	// to RPCs (persistence not wired yet).
+	term int
+	// candidateId that received vote in current term (or null if none; -1 here)
+	votedFor int
+	// log entries; each entry contains command for state machine, and term
+	// when entry was received by leader
+	log []LogEntry
+}
+
+// volatileState — Figure 2 "Volatile state on all servers"
+type volatileState struct {
+	commitIndex int // index of highest log entry known to be committed (paper inits to 0; -1 here because this code is 0-indexed with -1 as null)
+	lastApplied int // index of highest log entry applied to the state machine (same -1 note as commitIndex)
+	// the state machine itself; not part of Figure 2's table but volatile
+	// derived state: recomputed by replaying the log (§5.3) once persistence lands
+	stateMachine map[string]int
+}
+
+// leaderState — Figure 2 "Volatile state on leaders" (reinitialized after election)
+type leaderState struct {
+	// Figure 2 wants one nextIndex[] per server: "index of the next log entry
+	// to send to that server (initialized to leader last log index + 1)".
+	// The single value plus the empty per-peer maps below are pre-existing
+	// quirks kept unchanged by this refactor (see plan item 3).
+	nextIndex     int
+	nextIndexMap  map[int]int // map of nodeId to nextIndex for each node
+	matchIndexMap map[int]int // map of nodeId to highest log entry known to be replicated on server
+}
+
+// runtimeState — everything the Figure 2 table does not define:
+// identity, configuration, role bookkeeping, servers, and goroutine plumbing.
+type runtimeState struct {
+	// identity & configuration
 	id              int
+	peerInfo        RaftPeer         // the peer info of the node itself
+	nodes           map[int]RaftPeer // all nodes in the cluster, excluding itself, key is the nodeId
+	electionTimeout time.Duration    // randomized between 150-300ms
+
+	// role bookkeeping (§5.1/§5.2)
+	leaderId     int // id of the current leader; if this node is the leader, its own id; -1 if unknown
+	state        NodeState
+	currentVotes int // votes received in the current term; resets to 0 when the term changes
+
+	// servers & goroutine plumbing
 	apiClient       http.ServeMux
+	client          *http.ServeMux // the restful http server
 	server          *grpc.Server
 	resetElectionCh chan struct{}
 	stopHeartbeatCh chan struct{}
-	term            int            //Current term of the node
-	votedFor        int            //To keep track who the node voted for in the current term, -1 if it hasn't voted yet
-	currentVotes    int            //To keep track of the votes received in the current term , //Resets to 0 when the term changes
-	client          *http.ServeMux // The restfull http server
-	commitIndex     int            //Index of the highest log entry known to be committed
-	lastApplied     int            //Index of the highest log entry applied to the state machine
-	peerInfo        RaftPeer       //The peer info of the node itself
-	nextIndex       int
-	leaderId        int //Id of the current leader // if the node is a leader, this will be its own id
-	state           NodeState
-	electionTimeout time.Duration       // Randomized between 150-300ms
-	nodes           map[int]RaftPeer // A map of all nodes in the cluster , excluding itself, key is the nodeId
-	log             []LogEntry          //Log entries
-	nextIndexMap    map[int]int         //Map of nodeId to nextIndex for each node
-	matchIndexMap   map[int]int         //Map of nodeId to matchIndex for each node
-	stateMachine    map[string]int      //Key-value store
-	mu              sync.Mutex
+}
+
+type RaftNode struct {
+	persistentState // Figure 2: persistent state on all servers
+	volatileState   // Figure 2: volatile state on all servers
+	leaderState     // Figure 2: volatile state on leaders
+	runtimeState
+	mu sync.Mutex // guards all state groups above
 	raft.UnimplementedRaftServiceServer
 }
+func (r *RaftNode) majority() int { return (len(r.nodes)+1)/2 + 1 }
+
 func (r *RaftNode) GetNodeById(id int) (RaftPeer, bool) {
 	peer, ok := r.nodes[id]
 	return peer, ok
@@ -122,30 +160,31 @@ func (req *ExecuteCommandClientRequest) ToCommand() Command {
 }
 
 type nodeError struct {
-	error 
+	error
 	NodeId int //For retries
 
 }
 
-//Function to handle appendEntries Clients requests
-func (r *RaftNode)HandleAppendEntry(body ExecuteCommandClientRequest){
+// Function to handle appendEntries Clients requests
+func (r *RaftNode) HandleAppendEntry(body ExecuteCommandClientRequest) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if (r.state != LEADER) {
-		//Forward to the leader 
+	if r.state != LEADER {
+		//Forward to the leader
 		//NOTE: I think how will the forwarding work , Grpc? Modifiny the rest hosts ? sending an err to the client ?
 		//NOte: Candidates Are either grpc or putting everything behind  a reversy proxy that knows the leader
 	}
-	successCount:=0
+	successCount := 0
 	resChan := make(chan *raft.AppendEntriesResponse)
 	errChan := make(chan nodeError)
-	r.log = append(r.log, LogEntry{index: r.nextIndex,term: r.term, cmd: body.ToCommand()})
+	r.log = append(r.log, LogEntry{index: r.nextIndex, term: r.term, cmd: body.ToCommand()})
+	successCount++ //We count the leader's own append
 	for _, peer := range r.nodes {
 		go func(peer RaftPeer) {
 			r.AppendEntriesRpcCall([]*raft.LogEntry{&raft.LogEntry{
-				Command:body.ToCommand().String(),
-				Term: int32(r.term),
-				Index: int32(r.nextIndex),
+				Command: body.ToCommand().String(),
+				Term:    int32(r.term),
+				Index:   int32(r.nextIndex),
 			}}, peer, errChan, resChan)
 		}(peer)
 	}
@@ -160,13 +199,13 @@ func (r *RaftNode)HandleAppendEntry(body ExecuteCommandClientRequest){
 			if res.Success {
 				successCount++
 			}
-			if successCount > len(r.nodes)/2 {
+			if successCount > r.majority() {
 				//Commit the command to the state machine
-				r.MarkAsCommited(r.nextIndex-1)
+				r.MarkAsCommited(r.nextIndex - 1)
 				r.ApplyCommand(body.ToCommand())
-				r.lastApplied++;
+				r.lastApplied++
 				fmt.Println("Command committed successfully")
-				//Return to the client 
+				//Return to the client
 				return
 			}
 		}
@@ -174,14 +213,15 @@ func (r *RaftNode)HandleAppendEntry(body ExecuteCommandClientRequest){
 
 }
 
+// MarkAsCommited advances commitIndex.
+// Caller must hold r.mu (HandleAppendEntry holds it for its whole run).
 func (r *RaftNode) MarkAsCommited(index int) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-		r.commitIndex++;
+	r.commitIndex++
 }
+
 // Apply a single command to the state machine and doens't update the applyIndex (doesn't check if the command were commited or not, that should be done before calling this function)
 func (r *RaftNode) ApplyCommand(cmd Command) error {
-		if cmd.operation == SET {
+	if cmd.operation == SET {
 		r.stateMachine[cmd.key] = cmd.value
 	} else if cmd.operation == INCREMENT {
 		_, ok := r.stateMachine[cmd.key]
@@ -198,7 +238,6 @@ func (r *RaftNode) ApplyCommand(cmd Command) error {
 	return nil
 }
 
-
 func NewRaftApiClient() *http.ServeMux {
 
 	mux := http.NewServeMux()
@@ -206,12 +245,12 @@ func NewRaftApiClient() *http.ServeMux {
 		rawBody := make([]byte, r.ContentLength)
 		r.Body.Read(rawBody)
 		defer r.Body.Close()
-		var body ExecuteCommandClientRequest 
+		var body ExecuteCommandClientRequest
 		if err := json.Unmarshal(rawBody, &body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		
+
 	})
 	mux.HandleFunc("GET /get/{key}", func(w http.ResponseWriter, r *http.Request) {
 		rawKey := r.PathValue("key")
@@ -235,32 +274,41 @@ func NewRaftNode(id int, host string, port int, peers []RaftPeer) *RaftNode {
 	timeout += 150
 
 	return &RaftNode{
-		resetElectionCh: resetTimerCh,
-		stopHeartbeatCh: stopHeartBeatCh,
-		id:              id,
-		term:            0,
-		votedFor:        -1,
-		currentVotes:    0,
-		client:          http.NewServeMux(),
-		commitIndex:     -1,
-		lastApplied:     -1,
-		peerInfo:        RaftPeer{id: id, host: host, port: port},
-		nextIndex:       0,
-		leaderId:        -1,
-		state:           FOLLOWER,
-		electionTimeout: time.Duration(timeout) * time.Millisecond,
-		nodes:           nodes,
-		log:             make([]LogEntry, 0),
-		nextIndexMap:    make(map[int]int),
-		matchIndexMap:   make(map[int]int),
-		stateMachine:    make(map[string]int),
+		persistentState: persistentState{
+			term:     0, // Figure 2: initialized to 0 on first boot
+			votedFor: -1,
+			log:      make([]LogEntry, 0),
+		},
+		volatileState: volatileState{
+			// -1 instead of the paper's 0 because this code is 0-indexed with -1 as null
+			commitIndex:  -1,
+			lastApplied:  -1,
+			stateMachine: make(map[string]int),
+		},
+		leaderState: leaderState{
+			nextIndex:     0,
+			nextIndexMap:  make(map[int]int),
+			matchIndexMap: make(map[int]int),
+		},
+		runtimeState: runtimeState{
+			id:              id,
+			peerInfo:        RaftPeer{id: id, host: host, port: port},
+			nodes:           nodes,
+			electionTimeout: time.Duration(timeout) * time.Millisecond,
+			leaderId:        -1,
+			state:           FOLLOWER,
+			currentVotes:    0,
+			client:          http.NewServeMux(),
+			resetElectionCh: resetTimerCh,
+			stopHeartbeatCh: stopHeartBeatCh,
+		},
 	}
 }
 
 // TODO:review this logic because it is a bit iffy
 // Rpc Handlers  of a raftNode
 func (r *RaftNode) RequestVote(ctx context.Context, in *raft.RequestVoteRequest) (*raft.RequestVoteResponse, error) {
-r.mu.Lock()
+	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if in.Term < int32(r.term) {
@@ -276,7 +324,7 @@ r.mu.Lock()
 		return &raft.RequestVoteResponse{Term: int32(r.term), VoteGranted: false}, nil
 	}
 	//Verify what node is more "up-to-date"
-	myIdx := len(r.log) - 1 // -1 means empty log
+	myIdx := r.LastLogIndex() // -1 means empty log
 	myTerm := -1
 	if myIdx >= 0 {
 		myTerm = r.log[myIdx].term
@@ -285,14 +333,17 @@ r.mu.Lock()
 		(int(in.LastLogTerm) == myTerm && int(in.LastLogIndex) < myIdx) {
 		return &raft.RequestVoteResponse{Term: int32(r.term), VoteGranted: false}, nil
 	}
-	
-		r.votedFor = int(in.CandidateId)
+
+	r.votedFor = int(in.CandidateId)
 	r.term = int(in.Term)
 	// If the node is more up-to-date, vote for the candidate
 	return &raft.RequestVoteResponse{Term: int32(r.term), VoteGranted: true}, nil
 }
+
+// LastLogIndex returns the index of the last log entry, or -1 when the log is
+// empty (this code is 0-indexed with -1 as null; the paper is 1-indexed).
 func (r *RaftNode) LastLogIndex() int {
-	return 5
+	return len(r.log) - 1
 }
 
 func (r *RaftNode) RequestVoteRpc() {
@@ -329,7 +380,7 @@ func (r *RaftNode) RequestVoteRpc() {
 			request := &raft.RequestVoteRequest{
 				Term:         int32(r.term),
 				CandidateId:  int32(r.id),
-				LastLogIndex: int32(r.nextIndex),
+				LastLogIndex: int32(r.LastLogIndex()),
 				LastLogTerm:  lastLogTerm,
 			}
 			response, err := client.RequestVote(ctx, request)
@@ -350,7 +401,7 @@ func (r *RaftNode) RequestVoteRpc() {
 			if res.VoteGranted {
 				r.currentVotes++
 			}
-			if r.currentVotes > len(r.nodes)/2 {
+			if r.currentVotes >r.majority(){
 				//Exit Early
 				r.promotSelfToLeader()
 				fmt.Println("Node", r.id, "became the leader for term", r.term)
@@ -502,11 +553,7 @@ func (r *RaftNode) AppendEntries(ctx context.Context, in *raft.AppendEntriesRequ
 
 		r.log = append(r.log, LogEntry{cmd: CommandFromString(entry.Command), index: int(entry.Index), term: int(entry.Term)})
 	}
-	
 
-  
-	
-	
 	select {
 	case r.resetElectionCh <- struct{}{}:
 	default:
@@ -515,7 +562,8 @@ func (r *RaftNode) AppendEntries(ctx context.Context, in *raft.AppendEntriesRequ
 	return &raft.AppendEntriesResponse{Term: int32(r.term), Success: true}, nil
 
 }
-//Caller should hold r.mu
+
+// Caller should hold r.mu
 func (r *RaftNode) ApplyCommitedEntries() {
 	for r.lastApplied < r.commitIndex {
 		r.lastApplied++
@@ -528,7 +576,7 @@ func (r *RaftNode) ApplyCommitedEntries() {
 func (r *RaftNode) AppendEntriesRpcCall(entries []*raft.LogEntry, peer RaftPeer, errChan chan nodeError, resChan chan *raft.AppendEntriesResponse) {
 	conn, err := grpc.NewClient(fmt.Sprintf("%s:%d", peer.host, peer.port), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		errChan <- nodeError{error: err,NodeId: r.id}
+		errChan <- nodeError{error: err, NodeId: r.id}
 		fmt.Println("Error creating grpc client:", err)
 		return
 	}
@@ -546,7 +594,7 @@ func (r *RaftNode) AppendEntriesRpcCall(entries []*raft.LogEntry, peer RaftPeer,
 	response, err := client.AppendEntries(ctx, request)
 	if err != nil {
 		fmt.Println("Error calling AppendEntries:", err)
-		errChan <- nodeError{error: err,NodeId: r.id}
+		errChan <- nodeError{error: err, NodeId: r.id}
 		return
 	}
 	resChan <- response
@@ -576,8 +624,6 @@ type RequestVoteRpcBody struct {
 	lastLogIndex int
 	lastLogTerm  int
 }
-
-
 
 type LogEntry struct {
 	cmd   Command
