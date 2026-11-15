@@ -57,6 +57,7 @@ type Command struct {
 	value     int
 	operation Operation
 }
+
 func OperationFromInt(op int) Operation {
 	switch op {
 	case 0:
@@ -71,8 +72,8 @@ func OperationFromInt(op int) Operation {
 }
 
 func CommandFromString(cmd string) Command {
-	parts:=strings.Split(cmd, "|")
-	if (len(parts)!=3){
+	parts := strings.Split(cmd, "|")
+	if len(parts) != 3 {
 		panic("Invalid command string")
 	}
 
@@ -80,12 +81,12 @@ func CommandFromString(cmd string) Command {
 	if err != nil {
 		panic("Invalid command string")
 	}
-	op,err:= strconv.Atoi(parts[2])
+	op, err := strconv.Atoi(parts[2])
 
-  if err!=nil{
+	if err != nil {
 		panic("Invalid command string")
 	}
-	return Command{key: parts[0], value:value,operation: OperationFromInt(op)}
+	return Command{key: parts[0], value: value, operation: OperationFromInt(op)}
 }
 func (c Command) String() string {
 	return fmt.Sprintf("%s|%d|%d", c.key, c.value, c.operation)
@@ -121,6 +122,18 @@ type persistentState struct {
 	log []LogEntry
 }
 
+func NewPersistentState(path string) persistentState {
+
+	return persistentState{
+		term:     0, // Figure 2: initialized to 0 on first boot
+		votedFor: -1,
+		log:      make([]LogEntry, 0),
+	}
+}
+func (p *persistentState) save(path string) {
+
+}
+
 // volatileState — Figure 2 "Volatile state on all servers"
 type volatileState struct {
 	commitIndex int // index of highest log entry known to be committed (paper inits to 0; -1 here because this code is 0-indexed with -1 as null)
@@ -136,7 +149,6 @@ type leaderState struct {
 	// to send to that server (initialized to leader last log index + 1)".
 	// The single value plus the empty per-peer maps below are pre-existing
 	// quirks kept unchanged by this refactor (see plan item 3).
-	nextIndex     int
 	nextIndexMap  map[int]int // map of nodeId to nextIndex for each node
 	matchIndexMap map[int]int // map of nodeId to highest log entry known to be replicated on server
 }
@@ -171,6 +183,12 @@ type RaftNode struct {
 	mu sync.Mutex // guards all state groups above
 	raft.UnimplementedRaftServiceServer
 }
+type AppendResult struct {
+	PeerId int
+	Res    *raft.AppendEntriesResponse
+	Err    error
+}
+
 func (r *RaftNode) majority() int { return (len(r.nodes)+1)/2 + 1 }
 
 func (r *RaftNode) GetNodeById(id int) (RaftPeer, bool) {
@@ -191,58 +209,102 @@ type nodeError struct {
 
 }
 
+// StepDown reverts the node to follower. newTerm is the term seen in a request
+// or response (Figure 2: "If RPC request or response contains term T >
+// currentTerm: set currentTerm = T, convert to follower").
+func (r *RaftNode) StepDown(newTerm int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.term = newTerm
+	r.state = FOLLOWER
+	r.leaderId = -1
+	r.votedFor = -1
+	r.currentVotes = 0
+	slog.Info("Node is stepping down to follower", "node_id", strconv.Itoa(r.id), "term", strconv.Itoa(r.term))
+}
+
 // Function to handle appendEntries Clients requests
 func (r *RaftNode) HandleAppendEntry(body ExecuteCommandClientRequest) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.state != LEADER {
+		r.mu.Unlock()
 		//Forward to the leader
 		//NOTE: I think how will the forwarding work , Grpc? Modifiny the rest hosts ? sending an err to the client ?
 		//NOte: Candidates Are either grpc or putting everything behind  a reversy proxy that knows the leader
+		return
 	}
-	successCount := 0
-	resChan := make(chan *raft.AppendEntriesResponse)
-	errChan := make(chan nodeError)
-	r.log = append(r.log, LogEntry{index: r.nextIndex, term: r.term, cmd: body.ToCommand()})
-	successCount++ //We count the leader's own append
+	//The entry's index is simply where it lands in the log (0-indexed, -1 is the empty log)
+	entryIdx := len(r.log)
+	r.log = append(r.log, LogEntry{index: entryIdx, term: r.term, cmd: body.ToCommand()})
+	r.mu.Unlock()
+
+	successCount := 1 //We count the leader's own append
+	resChan := make(chan AppendResult, len(r.nodes))
 	for _, peer := range r.nodes {
 		go func(peer RaftPeer) {
-			r.AppendEntriesRpcCall([]*raft.LogEntry{&raft.LogEntry{
+			resChan <- r.AppendEntriesRpcCall([]*raft.LogEntry{&raft.LogEntry{
 				Command: body.ToCommand().String(),
 				Term:    int32(r.term),
-				Index:   int32(r.nextIndex),
-			}}, peer, errChan, resChan)
+				Index:   int32(entryIdx),
+			}}, peer)
 		}(peer)
 	}
-	r.nextIndex++
 
+	timeout := time.After(5 * time.Second)
 	for {
 		select {
-		case err := <-errChan:
-			//TODO : should retry here
-			fmt.Println("Error received:", err)
 		case res := <-resChan:
-			if res.Success {
-				successCount++
+
+			if res.Err != nil {
+
+					//A network error teaches nothing about the log, only a rejection does
+				fmt.Println("Replication failed for peer", res.PeerId, ":", res.Err)
+				//TODO: to be continued
+				return;
 			}
-			if successCount > r.majority() {
+			if res.Res.Success {
+				successCount++
+				//Every success advances that peer's maps, not only the one that tips the quorum
+				r.mu.Lock()
+				r.matchIndexMap[res.PeerId] = entryIdx
+				r.nextIndexMap[res.PeerId] = entryIdx + 1
+				r.mu.Unlock()
+			} else {
+				if res.Res.Term > int32(r.term) {
+					r.StepDown(int(res.Res.Term))
+				} else {
+					r.mu.Lock()
+					if r.nextIndexMap[res.PeerId] > 0 {
+						r.nextIndexMap[res.PeerId]--
+					}
+					r.mu.Unlock()
+				}
+			}
+			if successCount >= r.majority() {
 				//Commit the command to the state machine
-				r.MarkAsCommited(r.nextIndex - 1)
-				r.ApplyCommand(body.ToCommand())
-				r.lastApplied++
+				r.mu.Lock()
+				r.MarkAsCommited(entryIdx)
+				r.ApplyCommitedEntries()
+				r.mu.Unlock()
 				fmt.Println("Command committed successfully")
 				//Return to the client
 				return
 			}
+
+		case <-timeout:
+			//Quorum didn't happen, the entry stays in our log uncommitted (a future leader will commit or overwrite it)
+			return
 		}
 	}
 
 }
 
 // MarkAsCommited advances commitIndex.
-// Caller must hold r.mu (HandleAppendEntry holds it for its whole run).
+// Caller must hold r.mu.
 func (r *RaftNode) MarkAsCommited(index int) {
-	r.commitIndex++
+	if index > r.commitIndex {
+		r.commitIndex = index
+	}
 }
 
 // Apply a single command to the state machine and doens't update the applyIndex (doesn't check if the command were commited or not, that should be done before calling this function)
@@ -298,13 +360,8 @@ func NewRaftNode(id int, host string, port int, peers []RaftPeer) *RaftNode {
 	}
 	timeout := rand.IntN(150)
 	timeout += 150
-
 	return &RaftNode{
-		persistentState: persistentState{
-			term:     0, // Figure 2: initialized to 0 on first boot
-			votedFor: -1,
-			log:      make([]LogEntry, 0),
-		},
+		persistentState: NewPersistentState("dummy"),
 		volatileState: volatileState{
 			// -1 instead of the paper's 0 because this code is 0-indexed with -1 as null
 			commitIndex:  -1,
@@ -312,7 +369,6 @@ func NewRaftNode(id int, host string, port int, peers []RaftPeer) *RaftNode {
 			stateMachine: make(map[string]int),
 		},
 		leaderState: leaderState{
-			nextIndex:     0,
 			nextIndexMap:  make(map[int]int),
 			matchIndexMap: make(map[int]int),
 		},
@@ -362,6 +418,12 @@ func (r *RaftNode) RequestVote(ctx context.Context, in *raft.RequestVoteRequest)
 
 	r.votedFor = int(in.CandidateId)
 	r.term = int(in.Term)
+	// When gratting vote reset the election timer
+	//To keep it non-blocking we will use a select statement
+	select {
+	case r.resetElectionCh <- struct{}{}:
+	default:
+	}
 	// If the node is more up-to-date, vote for the candidate
 	return &raft.RequestVoteResponse{Term: int32(r.term), VoteGranted: true}, nil
 }
@@ -377,6 +439,10 @@ func (r *RaftNode) RequestVoteRpc() {
 	//But it has a bit of edge cases to handle so we will wait for this at the moment
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	//Every node that wants to become a leader MUST set its state to CANDIDATE before starting the election , this helps tracking all places where the node want to become a leader , and in the future we can abstract the r.STATE to a function to help gating the election better
+	if r.state != CANDIDATE {
+		return
+	}
 	r.term++
 	r.currentVotes = 1 //Vote for self
 	r.votedFor = r.id
@@ -427,7 +493,7 @@ func (r *RaftNode) RequestVoteRpc() {
 			if res.VoteGranted {
 				r.currentVotes++
 			}
-			if r.currentVotes >r.majority(){
+			if r.currentVotes >= r.majority() {
 				//Exit Early
 				r.promotSelfToLeader()
 				fmt.Println("Node", r.id, "became the leader for term", r.term)
@@ -438,7 +504,7 @@ func (r *RaftNode) RequestVoteRpc() {
 		}
 	}
 	// Keep this in case we exit the loop on the last item ig (I think I can remove this but I will come back to it )
-	if r.currentVotes > len(r.nodes)/2 {
+	if r.currentVotes >= r.majority() {
 		r.promotSelfToLeader()
 		fmt.Println("Node", r.id, "became the leader for term", r.term)
 	}
@@ -454,12 +520,17 @@ func (r *RaftNode) promotSelfToLeader() {
 	r.leaderId = r.id
 	r.votedFor = -1
 	r.currentVotes = 0
+	for p := range r.nodes {
+		r.nextIndexMap[p] = r.LastLogIndex() + 1
+		r.matchIndexMap[p] = -1
+	}
 
 	go r.startHearbeat()
 	go r.UpdateRoutingConfig()
 }
-//For the current approach this will update the caddy reverse proxy config to point to the new leader, and will reload caddy
-func (r *RaftNode) UpdateRoutingConfig(){
+
+// For the current approach this will update the caddy reverse proxy config to point to the new leader, and will reload caddy
+func (r *RaftNode) UpdateRoutingConfig() {
 	slog.Info("Updating routing config to point to new leader", "leader_id", strconv.Itoa(r.leaderId))
 
 }
@@ -479,29 +550,31 @@ func (r *RaftNode) startElectionTimer() {
 		case <-timer.C:
 			if r.state != LEADER {
 				fmt.Println("Election timeout reached, starting election for node", r.id)
+				//A timeout promotes the node to candidate before it can start the election
+				r.state = CANDIDATE
 				r.RequestVoteRpc()
-				timer.Reset(r.electionTimeout)
 			}
+			//Always re-arm, a leader that skips the campaign must not leave the timer dead
+			//or the Stop/drain dance below will wedge this loop forever after a demotion
+			timer.Reset(r.electionTimeout)
 		}
 	}
 }
 func sendHeartBeatToAllPeers(r *RaftNode) {
 	for _, peer := range r.nodes {
 		go func(peer RaftPeer) {
-			errChan := make(chan nodeError)
-			resChan := make(chan *raft.AppendEntriesResponse)
-			r.AppendEntriesRpcCall([]*raft.LogEntry{}, peer, errChan, resChan)
-			select {
-			case err := <-errChan:
-				//TODO: should retry here
-				fmt.Println("Error received:", err)
-				return
-			case res := <-resChan:
-				if res.Success {
-					fmt.Println("Heartbeat sent successfully to peer", peer.id)
-				} else {
-					fmt.Println("Heartbeat failed for peer", peer.id, "with term", res.Term)
+			res := r.AppendEntriesRpcCall([]*raft.LogEntry{}, peer)
+			if res.Err != nil {
+				//TODO: handle error
+				return;
+			}
+			if res.Res.Success {
+				fmt.Println("Heartbeat sent successfully to peer", peer.id)
+			} else {
+				if res.Res.Term > int32(r.term) {
+					r.StepDown(int(res.Res.Term))
 				}
+				fmt.Println("Heartbeat failed for peer", peer.id, "with term", res.Res.Term)
 			}
 		}(peer)
 	}
@@ -606,12 +679,11 @@ func (r *RaftNode) ApplyCommitedEntries() {
 		}
 	}
 }
-func (r *RaftNode) AppendEntriesRpcCall(entries []*raft.LogEntry, peer RaftPeer, errChan chan nodeError, resChan chan *raft.AppendEntriesResponse) {
+func (r *RaftNode) AppendEntriesRpcCall(entries []*raft.LogEntry, peer RaftPeer) AppendResult {
 	conn, err := grpc.NewClient(fmt.Sprintf("%s:%d", peer.host, peer.port), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		errChan <- nodeError{error: err, NodeId: r.id}
 		fmt.Println("Error creating grpc client:", err)
-		return
+		return AppendResult{PeerId: peer.id, Res: nil, Err: err}
 	}
 	defer conn.Close()
 	client := raft.NewRaftServiceClient(conn)
@@ -620,17 +692,16 @@ func (r *RaftNode) AppendEntriesRpcCall(entries []*raft.LogEntry, peer RaftPeer,
 	request := &raft.AppendEntriesRequest{
 		Term:         int32(r.term),
 		LeaderId:     int32(r.id),
-		PrevLogIndex: int32(r.nextIndex),
+		PrevLogIndex: int32(r.nextIndexMap[peer.id] - 1),
 		Entries:      entries, // Empty for heartbeat
 		LeaderCommit: int32(r.commitIndex),
 	}
 	response, err := client.AppendEntries(ctx, request)
 	if err != nil {
 		fmt.Println("Error calling AppendEntries:", err)
-		errChan <- nodeError{error: err, NodeId: r.id}
-		return
+		return AppendResult{PeerId: peer.id, Res: nil, Err: err}
 	}
-	resChan <- response
+	return AppendResult{PeerId: peer.id, Res: response, Err: nil}
 }
 func (r *RaftNode) Run() error {
 
