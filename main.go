@@ -292,6 +292,12 @@ type runtimeState struct {
 	server          *grpc.Server
 	resetElectionCh chan struct{}
 	stopHeartbeatCh chan struct{}
+
+	// client REST API surface (served by Run alongside the gRPC
+	// server; this is the port Caddy fronts, never Raft RPCs)
+	apiPort     int          // 0 = ephemeral (sandbox/tests); fixed ports in dev
+	apiListener net.Listener // current REST listener; Run closes the previous one on restart
+	proxy       ProxyManager // publishes leader changes to the routing proxy (noop unless RAFT_PROXY=caddy)
 }
 
 type RaftNode struct {
@@ -357,11 +363,12 @@ func (r *RaftNode) StepDown(newTerm int) {
 // Function to handle appendEntries Clients requests
 func (r *RaftNode) HandleAppendEntry(body ExecuteCommandClientRequest) {
 	r.mu.Lock()
+	//This gate exists twice on purpose: the REST handlers 409
+	//non-leaders at the HTTP boundary (newApiClient), this one is the
+	//defense-in-depth for direct/internal invocation. No silent
+	//forwarding — routing is the proxy's job (see UpdateRoutingConfig).
 	if r.state != LEADER {
 		r.mu.Unlock()
-		//Forward to the leader
-		//NOTE: I think how will the forwarding work , Grpc? Modifiny the rest hosts ? sending an err to the client ?
-		//NOte: Candidates Are either grpc or putting everything behind  a reversy proxy that knows the leader
 		return
 	}
 	//The entry's index is simply where it lands in the log (0-indexed, -1 is the empty log)
@@ -478,30 +485,69 @@ func (r *RaftNode) ApplyCommand(cmd Command) error {
 	return nil
 }
 
-func NewRaftApiClient() *http.ServeMux {
-
+// newApiClient builds the client-facing REST mux. Every handler goes
+// through the leader gate first: during the proxy's stale window (the
+// leader died, the new leader hasn't pushed its route yet) a non-leader
+// answers 409 immediately with the last known leaderId instead of
+// blocking — that fast-fail is what keeps the switch window cheap.
+func (r *RaftNode) newApiClient() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /set", func(w http.ResponseWriter, r *http.Request) {
-		rawBody := make([]byte, r.ContentLength)
-		r.Body.Read(rawBody)
-		defer r.Body.Close()
-		var body ExecuteCommandClientRequest
-		if err := json.Unmarshal(rawBody, &body); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-
-	})
-	mux.HandleFunc("GET /get/{key}", func(w http.ResponseWriter, r *http.Request) {
-		rawKey := r.PathValue("key")
-		key, err := strconv.ParseInt(rawKey, 10, 64)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-		}
-		fmt.Print(key)
-	})
+	mux.HandleFunc("POST /set", r.handleSet)
+	mux.HandleFunc("GET /get/{key}", r.handleGet)
 	return mux
+}
 
+// notLeaderResponse is the 409 body. leaderId is the node's current best
+// knowledge (-1 = unknown); it is a hint for retrying clients, not a
+// guarantee.
+type notLeaderResponse struct {
+	LeaderId int `json:"leaderId"`
+}
+
+// leaderGate returns true when this node may serve the request itself;
+// otherwise it writes the 409 and returns false.
+func (r *RaftNode) leaderGate(w http.ResponseWriter) bool {
+	r.mu.Lock()
+	isLeader, leaderId := r.state == LEADER, r.leaderId
+	r.mu.Unlock()
+	if isLeader {
+		return true
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusConflict)
+	_ = json.NewEncoder(w).Encode(notLeaderResponse{LeaderId: leaderId})
+	return false
+}
+
+func (r *RaftNode) handleSet(w http.ResponseWriter, req *http.Request) {
+	if !r.leaderGate(w) {
+		return
+	}
+	var body ExecuteCommandClientRequest
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	// 202 + hand-off: the commit path may block up to its replication
+	// timeout and an HTTP slot shouldn't. A commit-aware 200 (with the
+	// retry semantics that implies) is a separate decision, not this one.
+	go r.HandleAppendEntry(body)
+	w.WriteHeader(http.StatusAccepted)
+}
+
+func (r *RaftNode) handleGet(w http.ResponseWriter, req *http.Request) {
+	if !r.leaderGate(w) {
+		return
+	}
+	key := req.PathValue("key")
+	r.mu.Lock()
+	val, ok := r.stateMachine[key]
+	r.mu.Unlock()
+	if !ok {
+		http.Error(w, "key not found", http.StatusNotFound)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]int{key: val})
 }
 
 // nodePathFromId returns the state file path for a node. RAFT_DATA_DIR
@@ -515,7 +561,7 @@ func nodePathFromId(id int) string {
 	}
 	return fmt.Sprintf("%s/node_%d_state.json", dir, id)
 }
-func NewRaftNode(id int, host string, port int, peers []RaftPeer) *RaftNode {
+func NewRaftNode(id int, host string, port int, apiPort int, peers []RaftPeer) *RaftNode {
 	nodes := make(map[int]RaftPeer, len(peers))
 	resetTimerCh := make(chan struct{}, 1)
 	stopHeartBeatCh := make(chan struct{}, 1)
@@ -549,6 +595,8 @@ func NewRaftNode(id int, host string, port int, peers []RaftPeer) *RaftNode {
 			client:          http.NewServeMux(),
 			resetElectionCh: resetTimerCh,
 			stopHeartbeatCh: stopHeartBeatCh,
+			apiPort:         apiPort,
+			proxy:           NewProxyManager(),
 		},
 	}
 }
@@ -709,14 +757,52 @@ func (r *RaftNode) promotSelfToLeader() {
 	go r.UpdateRoutingConfig()
 }
 
-// For the current approach this will update the caddy reverse proxy config to point to the new leader, and will reload caddy
+// UpdateRoutingConfig publishes this node's client-API address to the
+// routing proxy. The ONLY caller is promotSelfToLeader: pushes are
+// transition-only (a node pays the quorum cost of an election before it
+// may touch the proxy), so a deposed leader can never fight the new
+// leader over the proxy config, and routing truth has a single writer.
+// Failures are logged, never fatal: a stale route still leaves direct
+// clients with the 409 NotLeader fallback, and the next election heals
+// the route.
 func (r *RaftNode) UpdateRoutingConfig() {
-	//leaderId is written under the mutex by elections; read it the same way
 	r.mu.Lock()
-	leader := r.leaderId
+	// Re-check after the lock: a higher-term AppendEntries may have
+	// stepped this node down between promotion and this goroutine
+	// running — pushing then would break the transition-only rule.
+	if r.state != LEADER {
+		r.mu.Unlock()
+		return
+	}
+	upd := RouteUpdate{LeaderId: r.id, APIAddr: r.apiAddrLocked(), Term: r.term}
 	r.mu.Unlock()
-	slog.Info("Updating routing config to point to new leader", "leader_id", strconv.Itoa(leader))
 
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := r.proxy.RouteToLeader(ctx, upd); err != nil {
+		slog.Warn("route push failed; direct clients keep the 409 fallback",
+			"node_id", strconv.Itoa(r.id), "term", strconv.Itoa(upd.Term), "error", err)
+	} else {
+		slog.Info("routing proxy now points at this node", "node_id", strconv.Itoa(r.id), "addr", upd.APIAddr, "term", strconv.Itoa(upd.Term))
+	}
+}
+
+// apiAddr returns the address clients/Caddy should reach this node's
+// REST API on: the resolved listener address when serving (sandbox uses
+// ephemeral ports), else the configured host:apiPort (the pre-Run
+// window only).
+func (r *RaftNode) apiAddr() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.apiAddrLocked()
+}
+
+// Caller must hold r.mu.
+func (r *RaftNode) apiAddrLocked() string {
+	if r.apiListener != nil {
+		return r.apiListener.Addr().String()
+	}
+	return fmt.Sprintf("%s:%d", r.peerInfo.host, r.apiPort)
 }
 func (r *RaftNode) startElectionTimer() {
 	r.mu.Lock()
@@ -947,6 +1033,35 @@ func (r *RaftNode) AppendEntriesRpcCall(entries []*raft.LogEntry, peer RaftPeer)
 func (r *RaftNode) Run() error {
 
 	go r.startElectionTimer()
+
+	// Client REST API. A restart (the sandbox re-runs Run after killing
+	// a node) closes the previous listener first so no stale serve loop
+	// lingers on the old address. A failed listen is an error, not a
+	// crash: Raft itself keeps running, while proxy routes and direct
+	// client calls degrade to the 409 path.
+	r.mu.Lock()
+	oldListener := r.apiListener
+	r.apiListener = nil
+	r.mu.Unlock()
+	if oldListener != nil {
+		oldListener.Close()
+	}
+	apiLis, apiErr := net.Listen("tcp", fmt.Sprintf("%s:%d", r.peerInfo.host, r.apiPort))
+	if apiErr != nil {
+		slog.Error("client API listen failed; proxy routes and direct clients will fail",
+			"node_id", strconv.Itoa(r.id), "error", apiErr)
+	} else {
+		r.mu.Lock()
+		r.apiListener = apiLis
+		r.mu.Unlock()
+		go func() {
+			slog.Info("client API listening", "node_id", strconv.Itoa(r.id), "addr", apiLis.Addr().String())
+			if err := http.Serve(apiLis, r.newApiClient()); err != nil {
+				slog.Error("client API server stopped", "node_id", strconv.Itoa(r.id), "error", err)
+			}
+		}()
+	}
+
 	lis, err := net.Listen("tcp", fmt.Sprintf("%s:%d", r.peerInfo.host, r.peerInfo.port))
 	if err != nil {
 		return err
@@ -1007,17 +1122,81 @@ type RaftRpc interface {
 }
 
 func main() {
-	node := NewRaftNode(
-		1,
-		"127.0.0.1",
-		50051,
-		[]RaftPeer{
-			{id: 2, host: "127.0.0.1", port: 50052},
-			{id: 3, host: "127.0.0.1", port: 50053},
-		},
-	)
+	id := envInt("RAFT_NODE_ID", 1)
+	host := envOr("RAFT_HOST", "127.0.0.1")
+	port := envInt("RAFT_PORT", 50050+id)
+	apiPort := envInt("RAFT_API_PORT", 8080+id)
+
+	peers, err := peersFromEnv(id, os.Getenv("RAFT_PEERS"))
+	if err != nil {
+		slog.Error("invalid RAFT_PEERS (want id=host:port,id=host:port)", "error", err)
+		os.Exit(1)
+	}
+
+	node := NewRaftNode(id, host, port, apiPort, peers)
 
 	if err := node.Run(); err != nil {
 		panic(err)
 	}
+}
+
+// envOr returns the environment variable's value, or def when unset/empty.
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+// envInt is envOr for integers; a malformed value logs and falls back
+// to def instead of killing an already-running node.
+func envInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		slog.Warn("invalid integer env value, using default", "key", key, "value", v, "default", def)
+		return def
+	}
+	return n
+}
+
+// peersFromEnv parses RAFT_PEERS as "id=host:port,id=host:port". An
+// empty spec falls back to the 3-node localhost layout (ids 1..3 on
+// ports 50051..50053), minus this node itself.
+func peersFromEnv(self int, spec string) ([]RaftPeer, error) {
+	if spec == "" {
+		var peers []RaftPeer
+		for id := 1; id <= 3; id++ {
+			if id == self {
+				continue
+			}
+			peers = append(peers, RaftPeer{id: id, host: "127.0.0.1", port: 50050 + id})
+		}
+		return peers, nil
+	}
+	var peers []RaftPeer
+	for _, part := range strings.Split(spec, ",") {
+		eq := strings.Index(part, "=")
+		if eq <= 0 {
+			return nil, fmt.Errorf("segment %q: want id=host:port", part)
+		}
+		id, err := strconv.Atoi(part[:eq])
+		if err != nil {
+			return nil, fmt.Errorf("segment %q: bad id: %w", part, err)
+		}
+		addr := part[eq+1:]
+		colon := strings.LastIndex(addr, ":")
+		if colon <= 0 {
+			return nil, fmt.Errorf("segment %q: want host:port", part)
+		}
+		port, err := strconv.Atoi(addr[colon+1:])
+		if err != nil {
+			return nil, fmt.Errorf("segment %q: bad port: %w", part, err)
+		}
+		peers = append(peers, RaftPeer{id: id, host: addr[:colon], port: port})
+	}
+	return peers, nil
 }

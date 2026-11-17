@@ -1,0 +1,13 @@
+# deploy/Caddyfile — the client entrypoint of the dev cluster and the
+# source of truth. deploy/caddy.json (go:embed-ed by proxy.go) is its
+# caddy-adapt compiled artifact; regenerate with `just gen-caddy`.
+#
+# The upstream is a bootstrap guess: node 1's client API. Nothing valid
+# has been pushed before the first election completes, so a request in
+# that window reaches node 1 and gets the fast 409 NotLeader answer with
+# the leader hint instead of a block. Every leader election rewrites the
+# upstream by POSTing a full-state replacement to the admin API
+# (127.0.0.1:2019/load), so this file's upstream only matters until then.
+:8080 {
+	reverse_proxy 127.0.0.1:8081
+}

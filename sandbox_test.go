@@ -235,8 +235,10 @@ func sandboxIndexOf(nodes []*RaftNode, id int) int {
 
 // sandboxStartCluster builds and starts an in-process cluster on distinct
 // ports and waits for the gRPC servers to come up. Nodes keep running when
-// the test returns (process exit releases the ports).
-func sandboxStartCluster(t *testing.T, numNodes, basePort int, sigs <-chan os.Signal) ([]*RaftNode, map[int]*RaftNode) {
+// the test returns (process exit releases the ports). The optional proxyFor
+// hook replaces each node's ProxyManager before Run (index i = node i+1);
+// without it nodes use the default (noop) backend.
+func sandboxStartCluster(t *testing.T, numNodes, basePort int, sigs <-chan os.Signal, proxyFor ...func(index int) ProxyManager) ([]*RaftNode, map[int]*RaftNode) {
 	t.Helper()
 	// Isolate this run's persistent-state files: NewRaftNode loads any
 	// existing state file for a node's id at boot, so a stale file left
@@ -258,7 +260,10 @@ func sandboxStartCluster(t *testing.T, numNodes, basePort int, sigs <-chan os.Si
 			}
 			peers = append(peers, RaftPeer{id: j + 1, host: "127.0.0.1", port: ports[j]})
 		}
-		n := NewRaftNode(i+1, "127.0.0.1", ports[i], peers)
+		n := NewRaftNode(i+1, "127.0.0.1", ports[i], 0, peers)
+		if len(proxyFor) > 0 && proxyFor[0] != nil {
+			n.proxy = proxyFor[0](i)
+		}
 		nodes = append(nodes, n)
 		byID[n.id] = n
 	}
@@ -277,6 +282,14 @@ func sandboxStartCluster(t *testing.T, numNodes, basePort int, sigs <-chan os.Si
 	for _, n := range nodes {
 		s := sandboxPoll(n)
 		t.Logf("[sandbox] node %d starts as %s term=%d", n.id, sandboxStateName(s.state), s.term)
+	}
+	// The REST API listeners bind synchronously inside Run; an unresolved
+	// addr here means the listen failed and every proxy/409 assertion
+	// below would chase a phantom address.
+	for _, n := range nodes {
+		if addr := n.apiAddr(); strings.HasSuffix(addr, ":0") {
+			t.Fatalf("node %d: client API address %q is not resolved (REST listen failed?)", n.id, addr)
+		}
 	}
 	return nodes, byID
 }
