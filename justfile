@@ -11,9 +11,22 @@ gen-proto:
         --go-grpc_out=paths=source_relative:. \
         $(find . -name '*.proto' -not -path './tmp/*')
 
-# Spin up a 5-node in-process cluster: elect, kill the leader, restart it (verbose logs)
+# Fast 3-node sandbox: elect, then simulate client commands
+# (set/increment/delete) and require cluster-wide state machine convergence
+sandbox-commands:
+    go test -run 'TestSandboxCommands' -v -count=1 -timeout 120s .
+
+# 5-node sandbox: elect, command, kill leader, restart, command again
+sandbox-election:
+    go test -run 'TestSandboxElection' -v -count=1 -timeout 200s .
+
+# Full sandbox: both tests (commands + election/failover)
 sandbox:
-    go test -run 'TestSandboxElection' -v -count=1 -timeout 150s .
+    go test -run 'TestSandbox' -v -count=1 -timeout 300s .
+
+# Full sandbox under the race detector (reports remaining unlocked state reads)
+sandbox-race:
+    go test -run 'TestSandbox' -v -count=1 -timeout 300s -race .
 
 # List available recipes
 default:
