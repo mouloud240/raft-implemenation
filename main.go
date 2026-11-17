@@ -71,7 +71,7 @@ func OperationFromInt(op int) Operation {
 	}
 }
 
-func CommandFromString(cmd string) Command {
+func CommandFromString(cmd string) ( *Command,error  ){
 	parts := strings.Split(cmd, "|")
 	if len(parts) != 3 {
 		panic("Invalid command string")
@@ -79,14 +79,14 @@ func CommandFromString(cmd string) Command {
 
 	value, err := strconv.Atoi(parts[1])
 	if err != nil {
-		panic("Invalid command string")
+		return nil, errors.New("Invalid command string")
 	}
 	op, err := strconv.Atoi(parts[2])
 
 	if err != nil {
-		panic("Invalid command string")
+		return nil, errors.New("Invalid command string")
 	}
-	return Command{key: parts[0], value: value, operation: OperationFromInt(op)}
+	return &Command{key: parts[0], value: value, operation: OperationFromInt(op)},nil
 }
 func (c Command) String() string {
 	return fmt.Sprintf("%s|%d|%d", c.key, c.value, c.operation)
@@ -656,8 +656,13 @@ func (r *RaftNode) AppendEntries(ctx context.Context, in *raft.AppendEntriesRequ
 				continue //Entry already exists, no need to append
 			}
 		}
+		cmd,err:= CommandFromString(entry.Command)
+		if err != nil {
+			return nil,err
+		}
+		
 
-		r.log = append(r.log, LogEntry{cmd: CommandFromString(entry.Command), index: int(entry.Index), term: int(entry.Term)})
+		r.log = append(r.log, LogEntry{cmd: *cmd, index: int(entry.Index), term: int(entry.Term)})
 	}
 
 	select {
